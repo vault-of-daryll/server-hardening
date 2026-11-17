@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+patterns=$(git rev-parse --git-path info/private-patterns)
+[ -f "$patterns" ] || exit 0
+# Check the message file as written: `-m`, `-F` and some cleanup modes keep lines starting with `#`, and a
+# false alarm on Git's own template text is safer than guessing which lines Git will drop.
+message=$(cat "$1")
+number=0
+while IFS= read -r pattern || [ -n "$pattern" ]; do
+  number=$((number + 1))
+  case "$pattern" in ''|\#*) continue ;; esac
+  status=0
+  printf '%s\n' "$message" | grep -Ei -e "$pattern" >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) printf 'private pattern #%s matched in <commit message>\n' "$number" >&2; exit 1 ;;
+    1) ;;
+    *) printf 'private pattern #%s is not a valid regular expression\n' "$number" >&2; exit 1 ;;
+  esac
+done < "$patterns"

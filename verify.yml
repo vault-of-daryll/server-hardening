@@ -1,0 +1,380 @@
+# Proves each control on the server. Changes nothing.
+# Run: ansible-playbook -i inventory.ini verify.yml
+- name: Verify server hardening
+  hosts: servers
+  become: true
+  vars:
+    ssh_port: "{{ ansible_port | default(22) | int }}"
+    public_ports: "{{ open_ports | default([]) | map('int') | list }}"
+    ssh_is_public: "{{ ssh_public | default(true) | bool }}"
+    allowed_ports: "{{ ([ssh_port | int] if ssh_is_public else []) + public_ports }}"
+    conn: "{{ ssh_conn.stdout.split() }}"
+    sshd_ctx: "host={{ conn[0] }},addr={{ conn[0] }},laddr={{ conn[2] }},lport={{ conn[3] }}"
+    sysctl_expected: "{{ lookup('ansible.builtin.template', '90-hardening.sysctl.j2').splitlines()
+                         | select('match', '^[a-z]') | map('regex_replace', '\\s*=\\s*', '=') | list }}"
+  tasks:
+    # --- SSH ---
+    - name: Read this connection as the server sees it (client address, server address and port)
+      ansible.builtin.shell: echo "$SSH_CONNECTION"
+      become: false
+      register: ssh_conn
+      changed_when: false
+
+    - name: Read the effective sshd settings for you and for root, from your address
+      ansible.builtin.command: /usr/sbin/sshd -T -C user={{ item }},{{ sshd_ctx }}
+      loop: ["{{ ansible_user }}", root]
+      register: sshd_t
+      changed_when: false
+
+    - name: SSH is key-only, no root, modern crypto
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - "'passwordauthentication no' in item.stdout_lines"
+          - "'kbdinteractiveauthentication no' in item.stdout_lines"
+          - "'authenticationmethods publickey' in item.stdout_lines"
+          - "'permitrootlogin no' in item.stdout_lines"
+          - "'pubkeyauthentication yes' in item.stdout_lines"
+          - "'x11forwarding no' in item.stdout_lines"
+          - "'allowagentforwarding no' in item.stdout_lines"
+          - "'usedns no' in item.stdout_lines"
+          - (item.stdout_lines | select('match', '^allowusers ') | map('regex_replace', '^allowusers ', '') | sort | list)
+            == (ssh_allow_users | default([ansible_user]) | sort | list)
+          - item.stdout is not search('(?m)^(ciphers|macs) .*(cbc|sha1|md5)')
+          - item.stdout is not search('(?m)^kexalgorithms .*sha1')
+        fail_msg: "sshd settings for {{ item.item }} are not hardened; run harden.yml (X11Forwarding and AllowAgentForwarding must be no)"
+      loop: "{{ sshd_t.results }}"
+      loop_control: {label: "{{ item.item }}"}
+
+    - name: Read every allowed SSH user's groups
+      ansible.builtin.command:
+        argv: [id, -nG, "{{ item }}"]
+      loop: "{{ ssh_allow_users | default([ansible_user]) }}"
+      register: ssh_groups
+      changed_when: false
+
+    - name: The SSH user cannot get root through the docker group
+      ansible.builtin.assert:
+        quiet: true
+        that: "'docker' not in item.stdout.split()"
+        fail_msg: >-
+          {{ item.item }} is in the docker group, which gives root without a password;
+          remove it with sudo gpasswd -d {{ item.item }} docker and use sudo docker.
+      loop: "{{ ssh_groups.results }}"
+      loop_control: {label: "{{ item.item }}"}
+
+    - name: A password-only login is refused, and the server offers nothing but keys
+      ansible.builtin.command: >-
+        ssh -o ControlPath=none -o ControlMaster=no -o BatchMode=yes -o PubkeyAuthentication=no
+        -o PreferredAuthentications=password,keyboard-interactive -o ConnectTimeout=10
+        {{ ansible_ssh_common_args | default('') }} -o StrictHostKeyChecking=accept-new -S none
+        -p {{ ssh_port }} {{ ansible_user }}@{{ ansible_host | default(inventory_hostname) }} true
+      delegate_to: localhost
+      become: false
+      register: pw
+      failed_when: false
+      changed_when: false
+      no_log: true  # the command line can hold tunnel tokens from ansible_ssh_common_args
+
+    - name: The password-only login was refused with publickey as the only method
+      ansible.builtin.assert:
+        that: pw.rc != 0 and pw.stderr is search('Permission denied \(publickey\)\.')
+        fail_msg: "Expected 'Permission denied (publickey).', got rc={{ pw.rc }}: {{ pw.stderr | trim }}"
+
+    # --- Kernel ---
+    - name: Read every kernel setting the kit manages
+      tags: [kernel]
+      ansible.builtin.command: sysctl -n {{ sysctl_expected | map('regex_replace', '=.*', '') | join(' ') }}
+      register: sysctl
+      changed_when: false
+      failed_when: false
+
+    - name: Every kernel setting is applied
+      tags: [kernel]
+      ansible.builtin.assert:
+        quiet: true
+        that: wrong | length == 0
+        fail_msg: "Not applied (expected key=value): {{ wrong }}"
+      vars:
+        actual: "{{ sysctl_expected | map('regex_replace', '=.*', '') | zip(sysctl.stdout_lines) | map('join', '=') | list }}"
+        wrong: "{{ sysctl_expected | difference(actual) }}"
+
+    - name: Read what would reset kernel settings at the next boot (ufw's own sysctl file, apport)
+      tags: [kernel]
+      ansible.builtin.shell: |
+        # ufw and apport source these files as shell, so the last assignment wins; read the value they end up with
+        # a file that fails to source must not read as a safe empty value
+        if ! v=$(sh -c '. /etc/default/ufw >/dev/null 2>&1 && printf %s "$IPT_SYSCTL"'); then
+          echo "cannot read /etc/default/ufw as shell"
+        elif [ -n "$v" ]; then
+          echo "ufw still applies its own sysctl file: IPT_SYSCTL=$v in /etc/default/ufw"
+        fi
+        if [ -e /usr/share/apport/apport ]; then
+          if ! v=$(sh -c '. /etc/default/apport >/dev/null 2>&1 && printf %s "$enabled"'); then
+            echo "cannot read /etc/default/apport as shell"
+          elif [ "$v" != 0 ]; then
+            echo "apport is enabled=$v in /etc/default/apport, not 0"
+          fi
+          systemctl is-enabled --quiet apport.service && echo "apport.service is enabled"
+          systemctl is-active --quiet apport.service && echo "apport.service is running"
+        fi
+        true
+      register: boot_resets
+      changed_when: false
+
+    - name: Nothing resets the kernel settings at the next boot
+      tags: [kernel]
+      ansible.builtin.assert:
+        quiet: true
+        that: boot_resets.stdout_lines | length == 0
+        fail_msg: "{{ boot_resets.stdout_lines }}"
+
+    # --- Firewall ---
+    - name: Read the firewall
+      ansible.builtin.command: ufw status verbose
+      register: fw
+      changed_when: false
+
+    - name: Read IPv6 setting of the firewall
+      ansible.builtin.command: grep -E '^IPV6=yes' /etc/default/ufw
+      changed_when: false
+
+    - name: Firewall is on, denies incoming, and opens only SSH and open_ports
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - "'Status: active' in fw.stdout"
+          - "'deny (incoming)' in fw.stdout"
+          - extra | length == 0
+        fail_msg: "Unexpected open rules: {{ extra }}"
+      vars:
+        rules: "{{ fw.stdout_lines | select('search', '\\s(ALLOW|LIMIT) IN\\s') | list }}"
+        extra: "{{ rules | reject('match', '^(' ~ (allowed_ports | join('|')) ~ ')/tcp(\\s|$)') | list }}"
+
+    # --- Updates ---
+    - name: Read the unattended-upgrades setting
+      ansible.builtin.command: apt-config dump APT::Periodic::Unattended-Upgrade
+      register: upd
+      changed_when: false
+
+    - name: Read the merged unattended-upgrades origins (all apt config files)
+      ansible.builtin.command: apt-config dump
+      register: origins
+      changed_when: false
+
+    - name: Security updates are an allowed origin
+      ansible.builtin.assert:
+        quiet: true
+        that: >-
+          origins.stdout_lines | select('match', 'Unattended-Upgrade::(Allowed-Origins|Origins-Pattern):: ')
+          | select('search', '-security') | list | length > 0
+        fail_msg: "No effective unattended-upgrades origin includes the security archive"
+
+    - name: Look for Docker's apt repository
+      ansible.builtin.shell: |
+        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+          [ -f "$source" ] || continue
+          if grep -qF download.docker.com "$source"; then
+            echo configured
+            break
+          fi
+        done
+      register: docker_repo
+      changed_when: false
+      check_mode: false
+
+    - name: Check that an effective Docker origin includes the stable channel
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import fnmatch
+            import re
+            import sys
+            release = sys.argv[1]
+            aliases = dict(o='origin', l='label', c='component', a='archive', suite='archive', n='codename')
+            stable = dict(origin='Docker', label='Docker CE', component='stable',
+                          archive=release, codename=release, site='download.docker.com')
+            for line in sys.stdin:
+                match = re.fullmatch(r'Unattended-Upgrade::(Origins-Pattern|Allowed-Origins):: "([^"\n]*)";\s*', line)
+                if not match:
+                    continue
+                kind, value = match.groups()
+                value = value.replace('${distro_codename}', release).replace('${distro_id}', sys.argv[2])
+                if kind == 'Allowed-Origins':
+                    if value == 'Docker:' + release:
+                        sys.exit(0)
+                    continue
+                fields = [part.strip().split('=', 1) for part in value.split(',')]
+                if any(len(part) != 2 for part in fields):
+                    continue
+                fields = [(aliases.get(key.strip(), key.strip()), value.strip()) for key, value in fields]
+                if not all((key, stable[key]) in fields for key in ('origin', 'label', 'component')):
+                    continue
+                if all(key in stable and fnmatch.fnmatchcase(stable[key], value) for key, value in fields):
+                    sys.exit(0)
+            sys.exit(1)
+          - "{{ ansible_facts['distribution_release'] }}"
+          - "{{ ansible_facts['distribution'] }}"
+        stdin: "{{ origins.stdout }}"
+      register: docker_origin
+      changed_when: false
+      failed_when: false
+      when: docker_auto_updates | default(false) | bool and docker_repo.stdout | length > 0
+
+    - name: Docker updates are an allowed origin
+      ansible.builtin.assert:
+        quiet: true
+        that: docker_origin.rc == 0
+        fail_msg: "Docker's apt repository is configured but its origin is not allowed for stable unattended upgrades; run harden.yml"
+      when: docker_auto_updates | default(false) | bool and docker_repo.stdout | length > 0
+
+    - name: Read the update timers and the last upgrade run
+      ansible.builtin.systemd_service: {name: "{{ item }}"}
+      loop: [apt-daily.timer, apt-daily-upgrade.timer, apt-daily-upgrade.service]
+      register: units
+
+    - name: Update timers are enabled and running, and the last upgrade did not fail
+      ansible.builtin.assert:
+        quiet: true
+        that: >-
+          (item.status.ActiveState != 'failed') if item.item.endswith('.service')
+          else (item.status.UnitFileState == 'enabled' and item.status.ActiveState == 'active')
+      loop: "{{ units.results }}"
+      loop_control: {label: "{{ item.item }}"}
+
+    - name: Look for the unattended-upgrades program
+      ansible.builtin.stat: {path: /usr/bin/unattended-upgrade}
+      register: uu_bin
+
+    - name: Automatic security updates are installed
+      ansible.builtin.assert: {quiet: true, that: uu_bin.stat.exists, fail_msg: "unattended-upgrades is not installed"}
+
+    - name: Automatic security updates are on
+      ansible.builtin.assert: {quiet: true, that: upd.stdout is search('"1"')}
+
+    # --- Reboot ---
+    - name: Look for a pending reboot after updates
+      ansible.builtin.stat: {path: /var/run/reboot-required}
+      register: reboot_flag
+      tags: [reboot]
+
+    - name: No update is waiting for a reboot (a patched kernel only protects once it runs)
+      ansible.builtin.assert:
+        quiet: true
+        that: not reboot_flag.stat.exists
+        fail_msg: "Updates are installed but need a reboot: sudo reboot at a quiet moment"
+      tags: [reboot]
+
+    # --- Docker ---
+    - name: Look for snap Docker
+      ansible.builtin.shell: test -d /snap/docker && echo snap || true
+      register: docker_snap
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse snap Docker
+      ansible.builtin.assert:
+        quiet: true
+        that: docker_snap.stdout | length == 0
+        fail_msg: "Snap Docker is not supported; use Docker's apt packages or a static install"
+
+    - name: Look for Docker (client on PATH, or its socket)
+      ansible.builtin.shell: command -v docker || true
+      register: docker_client
+      changed_when: false
+
+    - name: Look for the Docker socket
+      ansible.builtin.stat: {path: /var/run/docker.sock}
+      register: docker_sock
+
+    - name: A Docker socket without a client can't be checked
+      ansible.builtin.assert:
+        quiet: true
+        that: docker_client.stdout | length > 0 or not docker_sock.stat.exists
+        fail_msg: "/var/run/docker.sock exists but no docker client is on PATH, so published ports can't be checked"
+
+    - name: List every host port a running container publishes, with its address
+      ansible.builtin.shell: |
+        set -o pipefail
+        ids=$(docker ps -q) || exit 1
+        [ -z "$ids" ] && exit 0
+        docker inspect --format '{{ "{{json .NetworkSettings.Ports}}" }}' $ids
+      args: {executable: /bin/bash}
+      register: published
+      changed_when: false
+      when: docker_client.stdout | length > 0
+
+    - name: No container port is public unless listed in open_ports
+      ansible.builtin.assert:
+        quiet: true
+        that: public | difference(public_ports) | length == 0
+        fail_msg: "Public container ports: {{ public }}. Bind them to 127.0.0.1 or add them to open_ports."
+      vars:
+        bindings: "{{ published.stdout_lines | map('from_json') | select | map('dict2items') | flatten
+                      | map(attribute='value') | select | flatten }}"
+        public: "{{ bindings | rejectattr('HostIp', 'match', '^(127\\.|::1$)') | map(attribute='HostPort') | map('int') | unique | list }}"
+      when: docker_client.stdout | length > 0
+
+    - name: List running containers that would stay stopped after a Docker restart
+      ansible.builtin.shell: |
+        set -o pipefail
+        ids=$(docker ps -q) || exit 1
+        [ -z "$ids" ] && exit 0
+        for id in $ids; do
+          # Skip a container that stopped after ps; any other inspect error fails the task.
+          docker inspect --format '{% raw %}{{.Name}} {{.HostConfig.RestartPolicy.Name}}{% endraw %}' "$id" ||
+            { running=$(docker ps -q) || exit 1; grep -qx "$id" <<< "$running" && exit 1; true; }
+        done | awk '$2 != "always" && $2 != "unless-stopped" {print $1}'
+      args: {executable: /bin/bash}
+      register: missing_restart
+      changed_when: false
+      when: docker_client.stdout | length > 0
+
+    - name: Every running container comes back after Docker restarts
+      ansible.builtin.assert:
+        quiet: true
+        that: missing_restart.stdout | trim | length == 0
+        fail_msg: >-
+          Containers that stay stopped after a Docker restart or reboot: {{ missing_restart.stdout_lines | reject('equalto', '') | join(', ') }}.
+          Give each one restart: unless-stopped (or always) so it comes back after a Docker restart or reboot.
+      when: docker_client.stdout | length > 0
+
+    - name: Look for the Docker daemon config
+      ansible.builtin.stat: {path: /etc/docker/daemon.json}
+      register: daemon_json_file
+      when: docker_client.stdout | length > 0
+
+    - name: Docker uses /etc/docker/daemon.json
+      ansible.builtin.assert:
+        quiet: true
+        that: daemon_json_file.stat.exists
+        fail_msg: "No /etc/docker/daemon.json. Run harden.yml."
+      when: docker_client.stdout | length > 0
+
+    - name: Read the Docker daemon config
+      ansible.builtin.slurp: {src: /etc/docker/daemon.json}
+      register: daemon
+      when: docker_client.stdout | length > 0
+
+    - name: Docker config blocks privilege escalation and rotates logs
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - cfg['no-new-privileges'] | default(false)
+          - cfg['log-opts']['max-size'] is defined
+      vars:
+        cfg: "{{ daemon.content | b64decode | from_json }}"
+      when: docker_client.stdout | length > 0
+
+    - name: Docker has been restarted since daemon.json changed
+      ansible.builtin.shell: |
+        set -o pipefail
+        started=$(systemctl show -p ActiveEnterTimestamp --value docker) || exit 1
+        [ -n "$started" ] || exit 1
+        started=$(date -d "$started" +%s) || exit 1
+        [ "$started" -ge "$(stat -c %Y /etc/docker/daemon.json)" ]
+      args: {executable: /bin/bash}
+      changed_when: false
+      when: docker_client.stdout | length > 0

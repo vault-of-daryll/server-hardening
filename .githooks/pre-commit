@@ -1,0 +1,64 @@
+#!/bin/sh
+# Enable with: git config core.hooksPath .githooks
+set -eu
+
+# Check private data before invoking scanners that may include file names in their output.
+patterns=$(git rev-parse --git-path info/private-patterns)
+if ! git diff --quiet --no-ext-diff -- .gitignore; then
+  printf '%s\n' 'stage or discard your .gitignore edit first' >&2
+  exit 1
+fi
+# A nested .gitignore can re-include a file the root allowlist excludes, even while untracked or ignored.
+# Git never reads one inside an ignored folder (such as .venv/), so only those in visible folders count.
+git ls-files -c -o -- ':(glob)*/**/.gitignore' | while IFS= read -r nested; do
+  if ! git check-ignore -q --no-index -- "${nested%/.gitignore}"; then
+    printf '%s\n' 'only the root .gitignore is allowed; remove the nested .gitignore files' >&2
+    exit 1
+  fi
+done
+# Screenshots and other binary files can't be checked for private data; documentation is text only.
+if git diff --cached --numstat --diff-filter=ACMR --no-ext-diff | grep -q '^-	-	'; then
+  printf '%s\n' 'binary files (screenshots, images, archives) are not allowed; use text' >&2
+  exit 1
+fi
+# Finish all path checks before content diagnostics can name any file.
+for mode in path content; do
+  git diff --cached --name-only -z --diff-filter=ACMR --no-ext-diff |
+    xargs -0 -r sh -eu -c '
+      patterns=$1
+      mode=$2
+      shift 2
+      for file do
+        if [ "$mode" = content ] && git check-ignore --no-index -q -- "$file"; then
+          printf "%s\n" "Staged path is excluded by the .gitignore allowlist" >&2
+          exit 1
+        fi
+        [ -f "$patterns" ] || continue
+        number=0
+        while IFS= read -r pattern || [ -n "$pattern" ]; do
+          number=$((number + 1))
+          case "$pattern" in ""|\#*) continue ;; esac
+          status=0
+          if [ "$mode" = path ]; then
+            printf "%s\n" "$file" | grep -Ei -e "$pattern" >/dev/null 2>&1 || status=$?
+            location="<staged path>"
+          else
+            git show ":./$file" | grep -Ei -e "$pattern" >/dev/null 2>&1 || status=$?
+            location=$file
+          fi
+          case "$status" in
+            0) printf "private pattern #%s matched in %s\n" "$number" "$location" >&2; exit 1 ;;
+            1) ;;
+            *) printf "private pattern #%s is not a valid regular expression\n" "$number" >&2; exit 1 ;;
+          esac
+        done < "$patterns"
+      done
+    ' sh "$patterns" "$mode"
+done
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --pre-commit --staged --redact --no-banner
+else
+  printf '%s\n' 'Install gitleaks to commit.' >&2
+  exit 1
+fi

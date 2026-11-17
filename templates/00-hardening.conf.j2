@@ -1,0 +1,25 @@
+# Managed by server-hardening kit. 00- so it wins over cloud-init's 50- file (sshd keeps the first value it reads).
+PermitRootLogin no
+# Only these accounts may log in over SSH (default: the account that runs the kit).
+AllowUsers {{ ssh_allow_users | default([ansible_user]) | join(' ') }}
+# Match Host rules then see the client address, which is what the kit checks.
+UseDNS no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+LoginGraceTime 30
+MaxStartups 10:30:60
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding {{ ssh_allow_tcp_forwarding | default('no') }}
+PermitTunnel no
+ClientAliveInterval 300
+ClientAliveCountMax 3
+LogLevel VERBOSE
+# Only algorithms this sshd knows; post-quantum hybrid first (ML-KEM is the OpenSSH 10.0 default).
+KexAlgorithms {{ kex | join(',') }}
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256

@@ -1,0 +1,373 @@
+# Apply:   ansible-playbook -i inventory.ini harden.yml
+# Dry run: add --check --diff
+- name: Harden a fresh Ubuntu or Debian VPS
+  hosts: servers
+  become: true
+  vars:
+    # Inventory values win; these are only fallbacks.
+    ssh_port: "{{ ansible_port | default(22) | int }}"
+    public_ports: "{{ open_ports | default([]) | map('int') | list }}"
+    # false: SSH only through a tunnel (for example cloudflared); the firewall keeps the SSH port closed.
+    ssh_is_public: "{{ ssh_public | default(true) | bool }}"
+    # The kit's own logins from this machine: same key and ssh options as Ansible, a fresh connection every time.
+    # ssh keeps the first -o value, so the safety options come first; -S (socket) is last because the last -S wins.
+    guard_ssh: >-
+      ssh -o ControlPath=none -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no
+      -o KbdInteractiveAuthentication=no -o PreferredAuthentications=publickey -o ConnectTimeout=10
+      {{ ('-i ' + ansible_ssh_private_key_file + ' -o IdentitiesOnly=yes') if ansible_ssh_private_key_file is defined else '' }}
+      {{ ansible_ssh_common_args | default('') }} -o StrictHostKeyChecking=accept-new -S none
+      -p {{ ssh_port }} {{ ansible_user }}@{{ ansible_host | default(inventory_hostname) }}
+    # sshd -T context for this connection. UseDNS is off, so sshd matches Host against the address too.
+    conn: "{{ ssh_conn.stdout.split() }}"
+    sshd_ctx: "host={{ conn[0] }},addr={{ conn[0] }},laddr={{ conn[2] }},lport={{ conn[3] }}"
+  tasks:
+    - name: Refuse unsupported systems
+      ansible.builtin.assert:
+        that: >-
+          (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version in ['24.04', '26.04'])
+          or (ansible_facts.distribution == 'Debian' and ansible_facts.distribution_major_version == '13')
+        fail_msg: >-
+          Supported servers: Ubuntu 24.04, Ubuntu 26.04 and Debian 13
+          (this is {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }})
+
+    - name: Refuse tunnel-only SSH unless this run itself comes through a tunnel or jump host
+      ansible.builtin.assert:
+        that: >-
+          ssh_is_public or (
+            (ansible_ssh_common_args | default('')) is search('ProxyCommand|ProxyJump|-J ')
+            and (ansible_ssh_common_args | default('')) is not search('Proxy(Command|Jump)[= ]+none'))
+        fail_msg: "ssh_public=false closes the SSH port; set ansible_ssh_common_args to your tunnel (ProxyCommand) first"
+
+    - name: Refuse to run as root (root login is about to be turned off)
+      ansible.builtin.assert:
+        that: ansible_user != 'root'
+        fail_msg: "Create a sudo user with your key first"
+
+    # --- Lockout guard: before anything changes ---
+    - name: Log in again from this machine with a key only and run sudo
+      ansible.builtin.command: "{{ guard_ssh }} sudo -n true"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      check_mode: false
+      register: guard
+      failed_when: false
+      no_log: true  # the command line can hold tunnel tokens from ansible_ssh_common_args
+
+    - name: Stop if that login failed
+      ansible.builtin.fail:
+        msg: "The key-only login with sudo failed: {{ guard.stderr | default('') | trim }}"
+      when: guard.rc | default(0) != 0
+
+    - name: Read the effective sshd settings
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: sshd_now
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse when sshd does not listen on the port this run uses
+      ansible.builtin.assert:
+        that: ("port " ~ ssh_port) in sshd_now.stdout_lines
+        fail_msg: "sshd does not list port {{ ssh_port }}; set ansible_port to the server's real SSH port"
+
+    - name: Refuse when sshd_config does not read the drop-in folder
+      ansible.builtin.command: grep -Eq '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config
+      changed_when: false
+      check_mode: false
+
+    - name: Read this connection as the server sees it (client address, server address and port)
+      ansible.builtin.shell: echo "$SSH_CONNECTION"
+      become: false
+      register: ssh_conn
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse tunnel-only SSH unless sshd sees this run arrive on loopback (a tunnel on this host)
+      ansible.builtin.assert:
+        that: ssh_is_public or conn[0] in ['127.0.0.1', '::1']
+        fail_msg: >-
+          ssh_public=false closes the SSH port, but this run reaches sshd from {{ conn[0] }}, not loopback;
+          the firewall would block that path. Point the tunnel at localhost:{{ ssh_port }} on the server.
+
+    # --- Packages and updates ---
+    - name: Install python3-apt so the dry run can read packages (also runs in --check)
+      ansible.builtin.apt: {name: python3-apt, state: present}
+      check_mode: false
+
+    - name: Install automatic updates and the firewall
+      ansible.builtin.apt: {name: [unattended-upgrades, ufw], state: present, update_cache: true}
+
+    - name: Turn on daily unattended upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+        mode: "0644"
+
+    - name: Look for Docker's apt repository
+      ansible.builtin.shell: |
+        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+          [ -f "$source" ] || continue
+          if grep -qF download.docker.com "$source"; then
+            echo configured
+            break
+          fi
+        done
+      register: docker_repo
+      changed_when: false
+      check_mode: false
+
+    # Docker publishes Origin=Docker, Label=Docker CE on Ubuntu and Debian; its test and nightly channels share them, so pin stable.
+    - name: Allow automatic updates from Docker's apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/52hardening-docker
+        content: |
+          Unattended-Upgrade::Origins-Pattern:: "origin=Docker,label=Docker CE,component=stable";
+        mode: "0644"
+      when: docker_auto_updates | default(false) | bool and docker_repo.stdout | length > 0
+
+    - name: Remove the Docker update origin unless explicitly enabled with its repository
+      ansible.builtin.file: {path: /etc/apt/apt.conf.d/52hardening-docker, state: absent}
+      when: not (docker_auto_updates | default(false) | bool) or docker_repo.stdout | length == 0
+
+    - name: Start the apt timers
+      ansible.builtin.systemd: {name: "{{ item }}", enabled: true, state: started}
+      loop: [apt-daily.timer, apt-daily-upgrade.timer]
+
+    # --- Kernel ---
+    - name: Remove the kernel settings file used by older kit runs
+      ansible.builtin.file: {path: /etc/sysctl.d/90-hardening.conf, state: absent}
+      register: old_sysctl_file
+      tags: [kernel]
+
+    - name: Write kernel hardening settings
+      ansible.builtin.template: {src: 90-hardening.sysctl.j2, dest: /etc/sysctl.d/99-zz-hardening.conf, mode: "0644"}
+      register: sysctl_file
+      tags: [kernel]
+
+    # ufw applies /etc/ufw/sysctl.conf on every start, after the kernel files, and it sets log_martians=0.
+    - name: Stop ufw from overriding kernel settings
+      ansible.builtin.lineinfile: {path: /etc/default/ufw, regexp: '^\s*(export\s+)?IPT_SYSCTL=', line: 'IPT_SYSCTL=', create: true, mode: "0644"}
+      register: ufw_sysctl
+      tags: [kernel]
+
+    # Ubuntu's apport sets fs.suid_dumpable=2 on every start, after the kernel files. Debian has no apport.
+    - name: Look for apport
+      ansible.builtin.stat: {path: /usr/share/apport/apport}
+      register: apport_bin
+      tags: [kernel]
+
+    - name: Turn off apport so it stops overriding fs.suid_dumpable
+      when: apport_bin.stat.exists
+      tags: [kernel]
+      block:
+        - name: Disable apport in its config
+          ansible.builtin.lineinfile: {path: /etc/default/apport, regexp: '^\s*(export\s+)?enabled=', line: 'enabled=0', create: true, mode: "0644"}
+          register: apport_conf
+
+        - name: Stop and disable the apport service
+          ansible.builtin.systemd: {name: apport.service, enabled: false, state: stopped}
+          register: apport_svc
+
+    - name: Load kernel settings  # noqa: no-handler -- runs now, before SSH, not at the end
+      ansible.builtin.command: sysctl --system
+      when: old_sysctl_file is changed or sysctl_file is changed or ufw_sysctl is changed or apport_conf is changed or apport_svc is changed
+      changed_when: true
+      tags: [kernel]
+
+    # --- Firewall: open SSH before turning it on ---
+    - name: Look for ufw
+      ansible.builtin.stat: {path: /usr/sbin/ufw}
+      register: ufw_bin
+
+    - name: Note that the dry run skips firewall rules until ufw is installed
+      ansible.builtin.debug: {msg: "ufw is not installed yet; a real run installs it and applies the rules"}
+      when: ansible_check_mode and not ufw_bin.stat.exists
+
+    - name: Read ufw state and rules waiting to be enabled
+      ansible.builtin.shell: ufw status && ufw show added
+      register: ufw_pending
+      changed_when: false
+      check_mode: false
+      when: ufw_bin.stat.exists
+
+    - name: Refuse to turn on ufw while it holds deny or reject rules (they could block SSH)
+      ansible.builtin.assert:
+        that: >-
+          'Status: active' in ufw_pending.stdout
+          or ufw_pending.stdout_lines | select('search', '^ufw (deny|reject)|^ufw .* (deny|reject) ') | list | length == 0
+        fail_msg: "ufw is off but has deny or reject rules; review them with 'sudo ufw show added' and delete or reorder them first"
+      when: ufw_bin.stat.exists
+
+    - name: Change the firewall, or turn ufw back off if SSH stops working
+      when: ufw_bin.stat.exists or not ansible_check_mode
+      block:
+        - name: Firewall IPv6 too
+          ansible.builtin.lineinfile: {path: /etc/default/ufw, regexp: '^IPV6=', line: 'IPV6=yes'}
+
+        - name: Allow SSH with rate limiting (skipped for tunnel-only SSH)
+          community.general.ufw: {rule: limit, port: "{{ ssh_port }}", proto: tcp}
+          when: ssh_is_public
+
+        - name: Allow listed ports
+          community.general.ufw: {rule: allow, port: "{{ item }}", proto: tcp}
+          loop: "{{ public_ports }}"
+
+        - name: Deny everything else incoming and enable ufw
+          community.general.ufw: {state: enabled, policy: deny, direction: incoming}
+
+        - name: Log in again with a key after the firewall change and run sudo
+          ansible.builtin.command: "{{ guard_ssh }} sudo -n true"
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          when: not ansible_check_mode
+          register: guard
+          failed_when: false
+          no_log: true  # the command line can hold tunnel tokens from ansible_ssh_common_args
+
+        - name: Stop if that login failed
+          ansible.builtin.fail:
+            msg: "The key-only login with sudo failed: {{ guard.stderr | default('') | trim }}"
+          when: guard.rc | default(0) != 0
+      rescue:
+        - name: Turn ufw off so new SSH logins work again (only if this run turned it on)
+          ansible.builtin.command: ufw --force disable
+          changed_when: true
+          # A firewall that was already on can't be what blocks the login: the kit only adds allow and limit rules.
+          when: >-
+            ufw_pending.stdout is not defined or 'Status: active' not in ufw_pending.stdout
+
+        - name: Stop here (firewall)
+          ansible.builtin.fail:
+            msg: >-
+              The firewall change or the new SSH login after it failed. If this run turned ufw on, it is off again;
+              a firewall that was already on was left on.
+              Check the ufw rules for the SSH port and how a tunnel reaches sshd.
+
+    # --- SSH: write, prove, reload, log in again; undo on any failure ---
+    - name: Read the KEX algorithms this sshd supports
+      ansible.builtin.command: ssh -Q kex
+      register: kex_supported
+      changed_when: false
+      check_mode: false
+
+    - name: Note whether the SSH drop-in exists before this run
+      ansible.builtin.stat: {path: /etc/ssh/sshd_config.d/00-hardening.conf}
+      register: dropin_before
+
+    - name: Change SSH, or put it back if anything fails
+      block:
+        - name: Write the SSH hardening drop-in
+          ansible.builtin.template:
+            src: 00-hardening.conf.j2
+            dest: /etc/ssh/sshd_config.d/00-hardening.conf
+            mode: "0600"
+            backup: true
+            validate: /usr/sbin/sshd -t -f %s
+          vars:
+            kex: "{{ ['mlkem768x25519-sha256', 'sntrup761x25519-sha512', 'sntrup761x25519-sha512@openssh.com',
+                      'curve25519-sha256', 'curve25519-sha256@libssh.org']
+                     | select('in', kex_supported.stdout_lines) | list }}"
+          register: dropin
+
+        - name: Prove the settings take effect for you and for root on this connection
+          ansible.builtin.command: /usr/sbin/sshd -T -C user={{ item }},{{ sshd_ctx }}
+          loop: ["{{ ansible_user }}", root]
+          register: sshd_new
+          changed_when: false
+          failed_when: >-
+            sshd_new.rc != 0
+            or 'passwordauthentication no' not in sshd_new.stdout_lines
+            or 'kbdinteractiveauthentication no' not in sshd_new.stdout_lines
+            or 'permitrootlogin no' not in sshd_new.stdout_lines
+            or 'authenticationmethods publickey' not in sshd_new.stdout_lines
+            or 'usedns no' not in sshd_new.stdout_lines
+            or (sshd_new.stdout_lines | select('match', '^allowusers ') | map('regex_replace', '^allowusers ', '') | sort | list)
+               != (ssh_allow_users | default([ansible_user]) | sort | list)
+            or ansible_user not in (ssh_allow_users | default([ansible_user]))
+          when: not ansible_check_mode
+
+        - name: Reload sshd (open sessions stay up)  # noqa: no-handler -- must run inside the undo block
+          ansible.builtin.systemd: {name: ssh, state: reloaded}
+          when: dropin is changed
+
+        - name: Log in again with a key after the change and run sudo
+          ansible.builtin.command: "{{ guard_ssh }} sudo -n true"
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          when: dropin is changed and not ansible_check_mode
+          register: guard
+          failed_when: false
+          no_log: true  # the command line can hold tunnel tokens from ansible_ssh_common_args
+
+        - name: Stop if that login failed
+          ansible.builtin.fail:
+            msg: "The key-only login with sudo failed: {{ guard.stderr | default('') | trim }}"
+          when: guard.rc | default(0) != 0
+      rescue:
+        - name: Put the previous SSH drop-in back
+          ansible.builtin.copy: {src: "{{ dropin.backup_file }}", dest: /etc/ssh/sshd_config.d/00-hardening.conf, remote_src: true, mode: "0600"}
+          when: dropin.backup_file is defined
+
+        - name: Remove the new SSH drop-in (there was none before this run)
+          ansible.builtin.file: {path: /etc/ssh/sshd_config.d/00-hardening.conf, state: absent}
+          when: dropin is changed and not dropin_before.stat.exists
+
+        - name: Reload sshd with the previous settings  # noqa: no-handler -- part of the undo
+          ansible.builtin.systemd: {name: ssh, state: reloaded}
+          when: dropin is changed
+
+        - name: Stop here
+          ansible.builtin.fail:
+            msg: >-
+              {{ 'SSH change failed and was undone; see the task above for the cause' if dropin is changed
+                 else 'SSH is not hardened: another setting, often in /etc/ssh/sshd_config before its Include line,'
+                      ~ ' overrides the drop-in. Nothing was changed.' }}
+
+    # --- Docker (only if installed); never restarted by this kit ---
+    - name: Look for snap Docker
+      ansible.builtin.shell: test -d /snap/docker && echo snap || true
+      register: docker_snap
+      changed_when: false
+      check_mode: false
+
+    - name: Say that snap Docker is not supported
+      ansible.builtin.debug:
+        msg: "Docker from snap keeps its config under /var/snap/docker; the kit leaves it alone. Use Docker's apt packages."
+      when: docker_snap.stdout | length > 0
+
+    - name: Look for the Docker daemon on PATH
+      ansible.builtin.shell: command -v dockerd || true
+      register: dockerd_path
+      changed_when: false
+      check_mode: false
+      when: docker_snap.stdout | length == 0
+
+    - name: Look for /etc/docker
+      ansible.builtin.stat: {path: /etc/docker}
+      register: docker_dir
+      when: docker_snap.stdout | length == 0 and dockerd_path.stdout | length > 0
+
+    - name: Create /etc/docker for a static Docker install
+      ansible.builtin.file: {path: /etc/docker, state: directory, mode: "0755"}
+      when: docker_snap.stdout | length == 0 and dockerd_path.stdout | length > 0 and not docker_dir.stat.exists
+
+    - name: Write Docker daemon defaults when none exist (never overwrites yours)
+      ansible.builtin.template:
+        src: daemon.json.j2
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        force: false
+        validate: "{{ dockerd_path.stdout }} --validate --config-file=%s"
+      when: docker_snap.stdout | length == 0 and dockerd_path.stdout | length > 0
+      register: daemon_json
+
+    - name: Say that Docker needs a planned restart  # noqa: no-handler -- a message, not a change
+      ansible.builtin.debug:
+        msg: >-
+          /etc/docker/daemon.json was written. Restart Docker in a quiet moment (sudo systemctl restart docker):
+          containers without a restart policy stay stopped after this first restart.
+      when: daemon_json is changed

@@ -1,0 +1,58 @@
+#!/bin/sh
+# Last check before anything leaves this machine. It also covers commits made where the other
+# hooks never ran: cherry-pick, rebase, am, --no-verify or another clone.
+set -eu
+patterns=$(git rev-parse --git-path info/private-patterns)
+zero=0000000000000000000000000000000000000000
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+# scan <text> <where>: refuse the push when any private pattern matches the text.
+scan() {
+  [ -f "$patterns" ] || return 0
+  number=0
+  while IFS= read -r pattern || [ -n "$pattern" ]; do
+    number=$((number + 1))
+    case "$pattern" in ''|\#*) continue ;; esac
+    status=0
+    printf '%s\n' "$1" | grep -Ei -e "$pattern" >/dev/null 2>&1 || status=$?
+    case "$status" in
+      0) fail "private pattern #$number matched in $2" ;;
+      1) ;;
+      *) fail "private pattern #$number is not a valid regular expression" ;;
+    esac
+  done < "$patterns"
+}
+command -v gitleaks >/dev/null 2>&1 || fail "Install gitleaks to push."
+while read -r _ local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  scan "$remote_ref" "an outgoing branch or tag name"
+  # A remote tip missing here (the remote moved and was not fetched) counts as a new ref,
+  # so every commit this remote does not already have is checked.
+  if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    range="$remote_sha..$local_sha"
+  elif git config "remote.$1.url" >/dev/null 2>&1; then
+    range="$local_sha --not --remotes=$1"
+  else
+    # Pushing to a URL or path: no remote-tracking refs to trust, so check the whole history.
+    range=$local_sha
+  fi
+  # Only commits are scanned, so a branch or tag that points at a file or tree is refused.
+  [ "$(git cat-file -t "$local_sha^{}")" = commit ] || fail "only commits and tags of commits can be pushed"
+  # Every annotated tag message in the chain is checked, even when its commit was pushed before.
+  object=$local_sha
+  while [ "$(git cat-file -t "$object")" = tag ]; do
+    scan "$(git cat-file -p "$object")" "an outgoing tag message"
+    object=$(git cat-file -p "$object" | sed -n '1s/^object //p')
+  done
+  # shellcheck disable=SC2086
+  commits=$(git rev-list $range) || fail "cannot list the outgoing commits"
+  for commit in $commits; do
+    short=$(git rev-parse --short "$commit")
+    # -m shows what a merge commit changes against each parent, so an edit made while merging is checked.
+    git diff-tree -m -r --root --numstat --no-commit-id "$commit" | grep -q '^-	-	' &&
+      fail "binary file in outgoing commit $short; use text"
+    scan "$(git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$commit"; git diff-tree -m -r --root -p --no-color --no-ext-diff "$commit")" \
+      "outgoing commit $short (message, author, paths or changes)"
+  done
+  # shellcheck disable=SC2086
+  gitleaks git --redact --no-banner --log-opts="-m $range" . >/dev/null 2>&1 || fail "gitleaks found a secret in the outgoing commits"
+done

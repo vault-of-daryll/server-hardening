@@ -1,0 +1,38 @@
+name: Bug
+description: Something the kit does wrong, or a check that fails when it should pass
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This issue is public.** Before you paste anything, replace real IP addresses, hostnames, usernames, domains and keys with placeholders such as `203.0.113.10`, `server1` and `deploy`. Paste text, not screenshots: a screenshot can show more than you meant to share. Security problems go through the private report link instead (SECURITY.md).
+  - type: input
+    id: version
+    attributes: {label: Kit version, description: "The tag or commit you ran, from `git describe --tags --always`"}
+    validations: {required: true}
+  - type: dropdown
+    id: os
+    attributes:
+      label: Server system
+      options: [Ubuntu 24.04, Ubuntu 26.04, Debian 13]
+    validations: {required: true}
+  - type: input
+    id: task
+    attributes: {label: Failing playbook and task, description: "For example: verify.yml, \"Firewall is on, denies incoming…\""}
+    validations: {required: true}
+  - type: textarea
+    id: what
+    attributes: {label: What happened and what you expected}
+    validations: {required: true}
+  - type: textarea
+    id: output
+    attributes:
+      label: Output, with real addresses and names replaced
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I replaced every real address, hostname, username, domain and key in this issue
+          required: true

@@ -1,0 +1,18 @@
+name: Idea
+description: A control the kit should add, change or drop
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: "**This issue is public.** Use placeholders for any real addresses, names or keys."
+  - type: textarea
+    id: problem
+    attributes: {label: What risk or problem it addresses}
+    validations: {required: true}
+  - type: textarea
+    id: proposal
+    attributes: {label: What the kit would do, and how verify.yml would prove it}
+    validations: {required: true}
+  - type: textarea
+    id: lockout
+    attributes: {label: "Could it lock someone out or break Docker? How is that avoided?"}

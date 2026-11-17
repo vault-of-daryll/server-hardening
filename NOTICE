@@ -1,0 +1,6 @@
+Server hardening kit
+
+This kit was informed by dev-sec/ansible-collection-hardening
+(https://github.com/dev-sec/ansible-collection-hardening, commit 06228ad),
+Copyright the DevSec Hardening Framework Team, licensed under the Apache
+License 2.0. This kit is a rewrite that reuses some of its setting choices.
